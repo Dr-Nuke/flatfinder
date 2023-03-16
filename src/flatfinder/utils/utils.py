@@ -111,6 +111,8 @@ def make_clickable(val):
 def load_df_safely(path):
     if os.path.isfile(path):
         lib = pd.read_csv(path)
+        dropcols = [col for col in lib.columns if 'Unnamed' in col]
+        lib.drop(columns=dropcols, inplace=True)
     else:
         lib = pd.DataFrame({'id': [], 'portal': []})
     return lib

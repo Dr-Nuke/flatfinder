@@ -13,6 +13,7 @@ import requests
 import re
 import math
 import smtplib
+import os
 
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -56,38 +57,48 @@ class ScraperHost:
         self.send_mail()
 
     def send_mail(self):
-        fromaddr = self.config.email.get('fromaddr')
-        toaddr = self.config.email.get('toaddr')
-        msg = MIMEMultipart()
-        msg['From'] = self.config.email.get('fromaddr')
-        msg['To'] = self.config.email.get('toaddr')
-        msg['Subject'] = self.config.email.get('subject')
+        try:
+            fromaddr = self.config.email.get('fromaddr')
+            toaddr = self.config.email.get('toaddr')
+            msg = MIMEMultipart()
+            msg['From'] = self.config.email.get('fromaddr')
+            msg['To'] = self.config.email.get('toaddr')
+            msg['Subject'] = self.config.email.get('subject')
 
+            intro = self.config.email.get('intro')
+            sendcols = ['zip', 'city', 'link', 'address',
+                        'brutto', 'rooms', 'floor', 'area', 'from', 'scrape_time']
 
-        intro = self.config.email.get('intro')
-        sendcols = ['portal', 'zip', 'city', 'link', 'address',
-                    'title', 'brutto', 'rooms', 'floor', 'area', 'from']
-        result = self.db[~self.db.id.isin(self.known_ids())][sendcols]
+            filters = self.db.processed & (~self.db.email_sent)
+            result = self.db[filters][sendcols]
+            strcols = ['zip', 'brutto', 'area', 'rooms']
+            result.fillna('')
+            for col in strcols:
+                result[col] = result[col].apply(lambda x: f'{x:g}')
 
-        result_formatted = result.sort_values(by='scrape_time', ascending=False).style.format(
-            {'link': u.make_clickable})
-        body = result_formatted.hide_index().render()
-        # second_table = old_results.hide_index().render()
+            result_formatted = result.sort_values(by='scrape_time', ascending=False).style.format(
+                {'link': u.make_clickable})
+            body = result_formatted.hide_index().render()
+            # second_table = old_results.hide_index().render()
 
-        msg.attach(MIMEText(intro, 'text'))
-        msg.attach(MIMEText(body, 'html'))
-        # msg.attach(MIMEText(second_table, 'html'))
+            msg.attach(MIMEText(intro, 'text'))
+            msg.attach(MIMEText(body, 'html'))
+            # msg.attach(MIMEText(second_table, 'html'))
 
-        server = smtplib.SMTP(self.config.email.get('smtp_host'),
-                              self.config.email.get('smtp_port'))
-        server.ehlo()
-        server.starttls()
-        server.ehlo()
-        server.login(self.config.email.get('fromaddr'),
-                     self.config.email.get('pwd'))
-        text = msg.as_string()
-        server.sendmail(fromaddr, toaddr, text)
-        logger.info('email sent')
+            server = smtplib.SMTP(self.config.email.get('smtp_host'),
+                                  self.config.email.get('smtp_port'))
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            server.login(self.config.email.get('fromaddr'),
+                         self.config.email.get('pwd'))
+            text = msg.as_string()
+            server.sendmail(fromaddr, toaddr, text)
+            self.db.at[filters, 'email_sent'] = True
+            # self.save_db(filters)
+            logger.info('email sent')
+        except Exception:
+            logger.exception(f"something went wrong sending emails")
 
     def run_portal(self, portal):
         logger.info(f'{portal}')
@@ -138,114 +149,145 @@ class ScraperHost:
             self.log_found_ads(df_new_ids)
 
         self.log_found_ads(all_ads_on_page, s=' overall')
+        new_ads = self.new_ads_to_db(all_ads_on_page)
+
+        self.zip_filter()
         # todo: add zip filtering
         # todo: add travel time filtering
         # todo: add noise geo.admin filtering
-        df_flatfox_ads = self.get_list_of_raw_ads(all_ads_on_page)
+        df_flatfox_ads = self.scrape_new_ads()
 
         # import pickle
         # with open('initial.pk', 'wb') as fh:
         #     pickle.dump(df_flatfox_ads, fh)
 
-        df_flatfox_ads = self.process_flatfox_ads(df_flatfox_ads)
-        self.add_to_archive(df_flatfox_ads)
+        df_flatfox_ads = self.process_flatfox_ads()
         return
 
+    def zip_filter(self):
+        pass
+
+    def new_ads_to_db(self, df):
+        # takes a new ads df, and adds so foar unknown ads to the db
+        df = df[~df.id.isin(self.db.id)]
+        self.db = pd.concat([self.db, df]).reset_index(drop=True)
+        self.save_db()
+        return df
+
     def add_to_archive(self, df):
-        "check in newly scraped ads to the archive"
+        """check in newly scraped ads to the archive"""
         self.db = pd.concat([self.db, df], ignore_index=True)
+        self.save_db()
+
+    def save_db(self, filters=None):
+        """saves the current status to file
+        filters: boolean pandas series.
+        """
+        if filters is not None:
+            if filters.sum == 0:
+                return
+
         self.db.to_csv(self.config.db_path,
                        index=False)
+        logger.info(f"saved {len(self.db)} ads in DB to {self.config.db_path}")
 
-    def process_flatfox_ads(self, df):
+    def process_flatfox_ads(self):
         # run processing jobs
 
-        n_iter = len(df)
+        filters = ~self.db.processed & \
+                  (self.db.scraped) & \
+                  (self.db.portal == self.current_portal) & \
+                  (self.db.instance == self.current_instance) & \
+                  (~self.db.raw_ad.isna())
+
+        n_iter = filters.sum()
         llogger = u.Looplogger(n_iter, f'processing {n_iter} entries')
-        for i, irow in df.sample(frac=1).iterrows():
-            if (not irow.scrape) or (irow.raw_ad is None):
-                continue
+        for j, (i, irow) in enumerate(self.db[filters].iterrows()):
+            try:
+                soup = BeautifulSoup(irow.raw_ad, features="html.parser")
+                title_field = soup.find('div', attrs={'class': 'widget-listing-title'})
+                self.db.at[i, 'address'] = u.html_clean_1(title_field.h2.text).split('-')[0].rstrip(' ')
+                self.db.at[i, 'title'] = u.html_clean_1(title_field.h1.text)
+                tables = soup.find_all('table',
+                                       attrs={'class': 'table table--rows table--fluid table--fixed table--flush'})
+                if len(tables) != 2:
+                    logger.info(f'expected 2 tables, found {len(tables)} for {irow["href"]}, {irow["fname"]}. ignoring')
+                    continue
 
-            result = {'index': [i]}
-            soup = BeautifulSoup(irow.raw_ad, features="html.parser")
+                data = []
+                rows = tables[0].find_all('tr')
+                for row in rows:
+                    cols = row.find_all('td')
+                    cols = [ele.text.strip() for ele in cols]
+                    data.append([ele for ele in cols if ele])  # Get rid of empty values
+                for ele in data:
+                    if 'bruttomiete' in ele[0].lower():
+                        self.db.at[i, 'brutto'] = u.extract_price_number_flatfox(ele[1])
+                    elif 'preiseinheit' in ele[0].lower():
+                        self.db.at[i, 'price_detail'] = ele[1]
+                    elif 'nettomiete' in ele[0].lower():
+                        self.db.at[i, 'netto'] = u.extract_price_number_flatfox(ele[1])
+                    elif 'nebenkosten' in ele[0].lower():
+                        self.db.at[i, 'utilities'] = u.extract_price_number_flatfox(ele[1])
+                    else:
+                        logger.info(f'unreckognized field {ele[0]} with value {ele[1]} on ad {irow["href"]}')
 
-            title_field = soup.find('div', attrs={'class': 'widget-listing-title'})
-            df.loc[i, 'address'] = u.html_clean_1(title_field.h2.text).split('-')[0].rstrip(' ')
-            df.loc[i, 'title'] = u.html_clean_1(title_field.h1.text)
-            tables = soup.find_all('table', attrs={'class': 'table table--rows table--fluid table--fixed table--flush'})
-            if len(tables) != 2:
-                logger.info(f'expected 2 tables, found {len(tables)} for {irow["href"]}, {irow["fname"]}. ignoring')
-                continue
+                data = []
+                rows = tables[1].find_all('tr')
+                for row in rows:
+                    cols = row.find_all('td')
+                    cols = [ele.text.strip() for ele in cols]
+                    data.append([ele for ele in cols if ele])  # Get rid of empty values
 
-            data = []
-            rows = tables[0].find_all('tr')
-            for row in rows:
-                cols = row.find_all('td')
-                cols = [ele.text.strip() for ele in cols]
-                data.append([ele for ele in cols if ele])  # Get rid of empty values
-            for ele in data:
-                if 'bruttomiete' in ele[0].lower():
-                    df.loc[i, 'brutto'] = u.extract_price_number_flatfox(ele[1])
-                elif 'preiseinheit' in ele[0].lower():
-                    df.loc[i, 'price_detail'] = ele[1]
-                elif 'nettomiete' in ele[0].lower():
-                    df.loc[i, 'netto'] = u.extract_price_number_flatfox(ele[1])
-                elif 'nebenkosten' in ele[0].lower():
-                    df.loc[i, 'utilities'] = u.extract_price_number_flatfox(ele[1])
+                for ele in data:
+                    if 'anzahl zimmer' in ele[0].lower():
+                        self.db.at[i, 'rooms'] = u.flatfox_fix_rooms(ele[1])
+                    elif 'besonderes' in ele[0].lower():
+                        self.db.at[i, 'special'] = ele[1]
+                    elif 'wohnfläche' in ele[0].lower():
+                        self.db.at[i, 'area'] = u.flatfox_squaremeters(ele[1])
+                    elif 'ausstattung' in ele[0].lower():
+                        self.db.at[i, 'particulars'] = ele[1]
+                    elif 'bezugstermin' in ele[0].lower():
+                        self.db.at[i, 'from'] = ele[1]
+
+                    elif 'referenz' in ele[0].lower():
+                        self.db.at[i, 'reference'] = ele[1]
+                    elif 'etage' in ele[0].lower():
+                        self.db.at[i, 'floor'] = ele[1]
+                    elif 'nutzfläche' in ele[0].lower():
+                        self.db.at[i, 'area_usage'] = ele[1]
+                    elif 'baujahr' in ele[0].lower():
+                        self.db.at[i, 'constructed'] = ele[1]
+                    elif 'webseite' in ele[0].lower():
+                        self.db.at[i, 'website'] = ele[1]
+                    elif 'dokumente' in ele[0].lower():
+                        pass
+                    elif 'kubatur' in ele[0].lower():
+                        pass
+                    elif 'Renovationsjahr' in ele[0].lower():
+                        pass
+                    else:
+                        logger.info(f'unreckognized field {ele[0]} with value {ele[1]} on ad {irow["link"]}')
+
+                if math.isfinite(self.db.loc[i, 'brutto']):
+                    self.db.at[i, 'rent'] = self.db.loc[i, 'brutto']
+                elif math.isfinite(self.db.loc[i, 'netto']):
+                    self.db.at[i, 'rent'] = self.db.loc[i, 'netto']
+                    if math.isfinite(self.db.loc[i, 'utilities']):
+                        self.db.at[i, 'rent'] += self.db.loc[i, 'utilities']
                 else:
-                    logger.info(f'unreckognized field {ele[0]} with value {ele[1]} on ad {irow["href"]}')
+                    logger.info(f'no rent info can be extracted from {df.loc[i, "link"]}')
 
-            data = []
-            rows = tables[1].find_all('tr')
-            for row in rows:
-                cols = row.find_all('td')
-                cols = [ele.text.strip() for ele in cols]
-                data.append([ele for ele in cols if ele])  # Get rid of empty values
-
-            for ele in data:
-                if 'anzahl zimmer' in ele[0].lower():
-                    df.loc[i, 'rooms'] = u.flatfox_fix_rooms(ele[1])
-                elif 'besonderes' in ele[0].lower():
-                    df.loc[i, 'special'] = ele[1]
-                elif 'wohnfläche' in ele[0].lower():
-                    df.loc[i, 'area'] = u.flatfox_squaremeters(ele[1])
-                elif 'ausstattung' in ele[0].lower():
-                    df.loc[i, 'particulars'] = ele[1]
-                elif 'bezugstermin' in ele[0].lower():
-                    df.loc[i, 'from'] = ele[1]
-
-                elif 'referenz' in ele[0].lower():
-                    df.loc[i, 'reference'] = ele[1]
-                elif 'etage' in ele[0].lower():
-                    df.loc[i, 'floor'] = ele[1]
-                elif 'nutzfläche' in ele[0].lower():
-                    df.loc[i, 'area_usage'] = ele[1]
-                elif 'baujahr' in ele[0].lower():
-                    df.loc[i, 'constructed'] = ele[1]
-                elif 'webseite' in ele[0].lower():
-                    df.loc[i, 'website'] = ele[1]
-                elif 'dokumente' in ele[0].lower():
-                    pass
-                elif 'kubatur' in ele[0].lower():
-                    pass
-                elif 'Renovationsjahr' in ele[0].lower():
-                    pass
-                else:
-                    logger.info(f'unreckognized field {ele[0]} with value {ele[1]} on ad {irow["link"]}')
-
-            if 'brutto' in result: #todo: rent seems to be missing in output
-                df.loc[i, 'rent'] = df.loc[i, 'brutto']
-            elif 'netto' in result:
-                df.loc[i, 'rent'] = df.loc[i, 'netto']
-                if 'utilities' in result:
-                    df.loc[i, 'rent'] += df.loc[i, 'utilities']
-            else:
-                logger.info(f'no rent info can be extracted from {irow["link"]}')
-
-            a = soup.find_all('div', attrs={'class': 'fui-stack'})[1]
-            df.loc[i, 'text'] = re.sub(r"^Beschreibung", "", u.html_clean_1(a.find_all('div')[-2].text))
-        df = df.drop(columns='raw_ad')
-        return df
+                a = soup.find_all('div', attrs={'class': 'fui-stack'})[1]
+                self.db.at[i, 'text'] = re.sub(r"^Beschreibung", "", u.html_clean_1(a.find_all('div')[-2].text))
+                self.db.at[i, 'processed'] = True
+                logger.info(f'processed i: {i}, j: {j}, id: {self.db.loc[i, "id"]}')
+            except Exception:
+                logger.exception(f"something went wrong processing i:{i} j:{j} id: {self.db.loc[i, 'id']}")
+        self.save_db(filters)
+        # df = df.drop(columns='raw_ad') # todo: needs
+        return
 
     def log_found_ads(self, df, s=''):
         "some enhanced and standardized logging"
@@ -255,24 +297,33 @@ class ScraperHost:
         logger.info(
             f"found{s} {n_newly_found}, of which {n_already_know} are already known and {n_befristet} are temporary")
 
-    def get_list_of_raw_ads(self, df_ads):
-        # given a list of ad adds, process those that are relevant, and merge to master db
-        # df_ads must have a 'scrape' (boolean) and 'link' column
-        df_ads = df_ads.reset_index(drop=True)
-        df_ads['raw_ad'] = None
-        last_sleeptime = 0
-        for i, row in df_ads.iterrows():
-            if row['scrape']:
-                last_sleeptime = u.wait_minimum(abs(random.gauss(0, 3)) + 5, last_sleeptime)
-                df_ads.loc[i, 'raw_ad'], df_ads.loc[i, 'scrape_time'] = self.scrape_individual_adpage(
-                    df_ads.loc[i, 'link'],
-                    i, len(df_ads))
+    def scrape_new_ads(self):
+        # takes all the ads from
+        filters = self.db.scrape & \
+                  (~self.db.scraped) & \
+                  (self.db.portal == self.current_portal) & \
+                  (self.db.instance == self.current_instance)
+        n_scrape_candidates = filters.sum()
 
-        return df_ads
+        last_sleeptime = 0
+        for j, (i, row) in enumerate(self.db[filters].iterrows()):
+            last_sleeptime = u.wait_minimum(abs(random.gauss(0, 3)) + 5, last_sleeptime)
+            try:
+                raw_ad, scrape_ts = self.scrape_individual_adpage(
+                    self.db.loc[i, 'link'], j, n_scrape_candidates)
+                if raw_ad is not None:
+                    self.db.at[i, 'scraped'] = True
+                    self.db.at[i, 'raw_ad'] = raw_ad
+                    self.db.at[i, 'scrape_time'] = scrape_ts
+            except Exception:
+                logger.exception("message")
+                logger.exception(f"could not scrape ad {self.db.loc[i, 'link']}")  # todo: note the failure in db
+        self.save_db(filters)
+        return
 
     def scrape_individual_adpage(self, url, i, total):
         # the scraper for an individual ad, given its url
-        logger.info(f'scraping adpage {i}/{total}: {url}')
+
         now = datetime.datetime.now().replace(microsecond=0)
         tries_remaining = 3
         while tries_remaining > 0:
@@ -280,6 +331,7 @@ class ScraperHost:
             tries_remaining -= 1
             if content.status_code == 200:
                 result = content.text
+                logger.info(f'scraped adpage {i}/{total}: {url}')
                 break
 
         if content.status_code != 200:
@@ -296,7 +348,7 @@ class ScraperHost:
         soup = BeautifulSoup(html_from_page, 'html.parser')
         adlist = soup.find('div', attrs={'class': 'search-result'})
         if len(adlist) != 1:
-            logger.error(f'exactly one adlist should be ther, but found {len(adlist)}')
+            logger.error(f'exactly one adlist should be there, but found {len(adlist)}')
             # todo: catch-action
         ads = adlist.find_all('div', attrs={'class': 'listing-thumb'})
         if not ads:
@@ -334,10 +386,14 @@ class ScraperHost:
             result.update({
                 'scrape': [scrape],
                 'archive': [archive],
-                'reason': reason,
-                'link': link,
-                'portal': self.current_portal,
-                'instance': self.current_instance})
+                'reason': [reason],
+                'link': [link],
+                'portal': [self.current_portal],
+                'instance': [self.current_instance],
+                'scraped': [False],
+                'processed': [False],
+                'email_sent': [False],
+            })
             dfs.append(pd.DataFrame(result))
         return pd.concat(dfs).reset_index(drop=True)
 
@@ -443,7 +499,15 @@ if __name__ == '__main__':
     if (configpath.parent.name != 'configs') or (configpath.name != 'config.py'):
         logger.error(f"config does not end with /config/config.py but instead is {configpath}. Aborting")
 
+    cwd = args.working_directory
+    if cwd is not None:
+        os.chdir(cwd)
+
     sys.path.append(str(configpath.parent))
+    logger.info(configpath.parent)
+    logger.info(sys.path)
+    logger.info(Path.cwd())
+
     from configs import config
 
     scraper_host = ScraperHost(config)
