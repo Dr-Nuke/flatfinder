@@ -104,18 +104,10 @@ def lib_path_maker(folder=Path(''), name='', dom=''):
     path = folder / ('_'.join([name, dom]) + '.csv')
     return path
 
+
 def make_clickable(val):
     # allows to cast a pandas url column into a clickable link
     return '<a target="_blank" href="{}">{}</a>'.format(val, 'link')
-
-def load_df_safely(path):
-    if os.path.isfile(path):
-        lib = pd.read_csv(path)
-        dropcols = [col for col in lib.columns if 'Unnamed' in col]
-        lib.drop(columns=dropcols, inplace=True)
-    else:
-        lib = pd.DataFrame({'id': [], 'portal': []})
-    return lib
 
 
 def make_float(x):

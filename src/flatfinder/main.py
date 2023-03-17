@@ -14,6 +14,7 @@ import re
 import math
 import smtplib
 import os
+import pySBB
 
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -39,8 +40,7 @@ class ScraperHost:
         self.driver = self.make_webdriver()
         self.current_instance = None
         self.current_portal = None
-        self.db = u.load_df_safely(self.config.db_path)
-        self.old_ids = self.db.id.values
+        self.db = self.load_df_safely(self.config.db_path)
         self.known = 'already known'
         self.temporary = 'Befristet'
         self.scraping_start = datetime.datetime.now()
@@ -66,18 +66,28 @@ class ScraperHost:
             msg['Subject'] = self.config.email.get('subject')
 
             intro = self.config.email.get('intro')
+            sbbcols = [v.get('df_col') for k, v in self.config.sbb.items()]
             sendcols = ['zip', 'city', 'link', 'address',
-                        'brutto', 'rooms', 'floor', 'area', 'from', 'scrape_time']
+                        'brutto', 'rooms', 'area', 'from', 'scrape_time']
+            sendcols.extend(sbbcols)
 
             filters = self.db.processed & (~self.db.email_sent)
+            if filters.sum() == 0:
+                logger.info(f'no new ads to send. quitting')
+                return
+
             result = self.db[filters][sendcols]
             strcols = ['zip', 'brutto', 'area', 'rooms']
-            result.fillna('')
+            result.fillna('', inplace=True)
             for col in strcols:
-                result[col] = result[col].apply(lambda x: f'{x:g}')
+                result[col] = result[col].apply(lambda x: x if isinstance(x, str) else f'{x:g}')
+            for col in sbbcols:
+                result[col] = result[col].dt.total_seconds().apply(lambda x: time.strftime('%H:%Mh', time.gmtime(x)))
 
-            result_formatted = result.sort_values(by='scrape_time', ascending=False).style.format(
-                {'link': u.make_clickable})
+            result_formatted = result.sort_values(by='scrape_time', ascending=False) \
+                .drop(columns=['scrape_time']) \
+                .style.format({'link': u.make_clickable})
+
             body = result_formatted.hide_index().render()
             # second_table = old_results.hide_index().render()
 
@@ -94,11 +104,27 @@ class ScraperHost:
                          self.config.email.get('pwd'))
             text = msg.as_string()
             server.sendmail(fromaddr, toaddr, text)
-            self.db.at[filters, 'email_sent'] = True
-            # self.save_db(filters)
+            self.db.loc[filters, 'email_sent'] = True
+            self.dump_page_source()
+            self.save_db(filters)
             logger.info('email sent')
         except Exception:
             logger.exception(f"something went wrong sending emails")
+
+    def dump_page_source(self):
+        """removes the page source from the db to save disk space"""
+        filters = self.db.scraped & self.db.email_sent
+        for j, (i, row) in enumerate(self.db[filters].iterrows()):
+            try:
+                fpath = self.config.data_dir / row.portal / \
+                        f'{row.id}_{self.db.scrape_time[0].strftime("%Y_%m_%d__%H_%M_%S")}.html'
+                fpath.parent.mkdir(parents=True, exist_ok=True)
+                with fpath.open("w", encoding="utf-8") as f:
+                    f.write(row.raw_ad)
+                self.db.at[i, 'filepath'] = str(fpath)
+                self.db.at[i, 'raw_ad'] = 'dumped'
+            except Exception:
+                logger.exception(f"something went wrong when dumping the ar sources")
 
     def run_portal(self, portal):
         logger.info(f'{portal}')
@@ -170,21 +196,18 @@ class ScraperHost:
     def new_ads_to_db(self, df):
         # takes a new ads df, and adds so foar unknown ads to the db
         df = df[~df.id.isin(self.db.id)]
-        self.db = pd.concat([self.db, df]).reset_index(drop=True)
-        self.save_db()
+        if len(df) > 0:
+            self.db = pd.concat([self.db, df]).reset_index(drop=True)
+            self.save_db()
         return df
-
-    def add_to_archive(self, df):
-        """check in newly scraped ads to the archive"""
-        self.db = pd.concat([self.db, df], ignore_index=True)
-        self.save_db()
 
     def save_db(self, filters=None):
         """saves the current status to file
         filters: boolean pandas series.
         """
         if filters is not None:
-            if filters.sum == 0:
+            if filters.sum() == 0:
+                logger.info('not saving db due to no news')
                 return
 
         self.db.to_csv(self.config.db_path,
@@ -277,10 +300,15 @@ class ScraperHost:
                     if math.isfinite(self.db.loc[i, 'utilities']):
                         self.db.at[i, 'rent'] += self.db.loc[i, 'utilities']
                 else:
-                    logger.info(f'no rent info can be extracted from {df.loc[i, "link"]}')
+                    logger.info(f'no rent info can be extracted from {self.db.loc[i, "link"]}')
 
                 a = soup.find_all('div', attrs={'class': 'fui-stack'})[1]
                 self.db.at[i, 'text'] = re.sub(r"^Beschreibung", "", u.html_clean_1(a.find_all('div')[-2].text))
+                for con, con_conf in self.config.sbb.items():
+                    self.db.at[i, con_conf.get('df_col')] = self.sbb_connection(self.db.loc[i, 'address'],
+                                                                                con_conf.get('arrival'),
+                                                                                con_conf.get('time'))
+
                 self.db.at[i, 'processed'] = True
                 logger.info(f'processed i: {i}, j: {j}, id: {self.db.loc[i, "id"]}')
             except Exception:
@@ -288,6 +316,25 @@ class ScraperHost:
         self.save_db(filters)
         # df = df.drop(columns='raw_ad') # todo: needs
         return
+
+    def sbb_connection(self, address, arrival, dt):
+        """ extracts the sbb duration given a start address, arrival address, and a datetime for arrival """
+
+        connections = []
+        try:
+            for page in range(3):
+                connections.extend(pySBB.get_connections(address,
+                                                         arrival,
+                                                         date=dt.strftime("%Y-%m-%d"),
+                                                         time=dt.strftime("%H:%M"),
+                                                         isArrivalTime=True,
+                                                         page=page))
+            duration = min([c.duration for c in connections])
+        except Exception:
+            logger.exception(f"something went wrong querying sbb connection from {address}")
+            duration = None
+
+        return duration
 
     def log_found_ads(self, df, s=''):
         "some enhanced and standardized logging"
@@ -307,6 +354,7 @@ class ScraperHost:
 
         last_sleeptime = 0
         for j, (i, row) in enumerate(self.db[filters].iterrows()):
+            if j > 10: break  # todo: remove debug
             last_sleeptime = u.wait_minimum(abs(random.gauss(0, 3)) + 5, last_sleeptime)
             try:
                 raw_ad, scrape_ts = self.scrape_individual_adpage(
@@ -363,29 +411,29 @@ class ScraperHost:
             if element.a is None:
                 continue  # weired things appearing in ads list. todo: investigate & fix
             key = element.a['href']
-            result = {'id': [key]}
-            if key in known_ids:
+            id = key.split('/')[-2]
+            result = {'id': [str(id)]}
+            if id in known_ids:
                 scrape = False
-                archive = False
                 reason = 'already known'
+                zip = ''
 
             elif self.temporary in element.a.find('div', 'attributes').text:
                 scrape = False
-                archive = True
                 reason = self.temporary
+                zip = ''
             else:
                 scrape = True
-                archive = True
                 reason = None
                 location = element.header.a.h2.find('span').text
                 zip_n_city = re.search(r'(\d{4})\s(.*)', location)
                 zip = zip_n_city.groups()[0]
                 city = zip_n_city.groups()[1]
-                result.update({'zip': zip, 'city': city})
+                result.update({'city': city})
             link = base + key
             result.update({
+                'zip': [str(zip)],
                 'scrape': [scrape],
-                'archive': [archive],
                 'reason': [reason],
                 'link': [link],
                 'portal': [self.current_portal],
@@ -453,6 +501,25 @@ class ScraperHost:
         driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         return driver
 
+    def load_df_safely(self, path):
+        if os.path.isfile(path):
+            date_cols = ['scrape_time']
+            dtypes = {'zip': str,
+                      'id': str}
+            lib = pd.read_csv(path,
+                              parse_dates=date_cols,
+                              dtype=dtypes,
+                              keep_default_na=False)  # make empty strings not turn into nan
+            dropcols = [col for col in lib.columns if 'Unnamed' in col]
+            lib.drop(columns=dropcols, inplace=True)
+            sbbcols = [v.get('df_col') for k, v in self.config.sbb.items()]
+            sbbcols = [col for col in sbbcols if col in lib.columns]
+            for col in sbbcols:  # fix timedeltas
+                lib[col] = pd.to_timedelta(lib[col])
+        else:
+            lib = pd.DataFrame({'id': [], 'portal': []})
+        return lib
+
 
 def extract_price_number_flatfox(s):
     # extracts int(2455) from "CHF 2’455 pro Monat", as found on flatfox
@@ -504,12 +571,26 @@ if __name__ == '__main__':
         os.chdir(cwd)
 
     sys.path.append(str(configpath.parent))
-    logger.info(configpath.parent)
-    logger.info(sys.path)
-    logger.info(Path.cwd())
 
-    from configs import config
+    logger.info(f'config path: {configpath.parent}')
+    logger.info(sys.path)
+    logger.info(f' cwd: {Path.cwd()}')
+
+    # import pdb
+    # pdb.set_trace()
+
+    # ------ evil hack to import configs
+    # from configs import config  # this is not working!!!
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("configs", str(configpath))
+    configs = importlib.util.module_from_spec(spec)
+    sys.modules["configs"] = configs
+    spec.loader.exec_module(configs)
+    config = configs
+    # ------ end of evil hack
 
     scraper_host = ScraperHost(config)
     scraper_host.run_main()
-    print('end')
+    logger.info('Flatfinder reached its end. Goodbye.')
+
