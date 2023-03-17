@@ -354,7 +354,6 @@ class ScraperHost:
 
         last_sleeptime = 0
         for j, (i, row) in enumerate(self.db[filters].iterrows()):
-            if j > 10: break  # todo: remove debug
             last_sleeptime = u.wait_minimum(abs(random.gauss(0, 3)) + 5, last_sleeptime)
             try:
                 raw_ad, scrape_ts = self.scrape_individual_adpage(
